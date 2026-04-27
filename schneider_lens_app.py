@@ -23,7 +23,7 @@ BASE_URL = "https://schneiderkreuznach.com"
 SITEMAP = BASE_URL + "/sitemap.xml"
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
@@ -34,7 +34,7 @@ HEADERS = {
 
 
 def get_product_urls_from_sitemap(session):
-    resp = session.get(SITEMAP, headers=HEADERS, timeout=15)
+    resp = session.get(SITEMAP, headers=HEADERS, timeout=20)
     root = ET.fromstring(resp.text)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
     all_urls = [loc.text for loc in root.findall(".//sm:loc", ns)]
@@ -42,11 +42,84 @@ def get_product_urls_from_sitemap(session):
     for u in all_urls:
         if "/en/industrial-optics/lenses/" not in u:
             continue
-        path = u.replace(BASE_URL, "")
+        path = u.replace(BASE_URL, "").rstrip("\"")
         depth = len([p for p in path.split("/") if p])
         if depth >= 6:
-            product_urls.append(u)
+            clean_url = u.rstrip("\"")
+            product_urls.append(clean_url)
     return product_urls
+
+
+def get_date_from_headers(resp_headers):
+    """Extract date from HTTP response headers."""
+    for header in ["Last-Modified", "Date", "Expires"]:
+        val = resp_headers.get(header, "")
+        if val:
+            try:
+                dt = parsedate_to_datetime(val)
+                return dt.strftime("%B %d, %Y"), dt.replace(tzinfo=None)
+            except Exception:
+                pass
+    return "", None
+
+
+def get_date_from_page(html, resp_headers):
+    """Try multiple strategies to get update date."""
+    # Strategy 1: Last-Modified or Date header from page response
+    date_str, date_obj = get_date_from_headers(resp_headers)
+    if date_obj:
+        return date_str, date_obj
+    # Strategy 2: JSON-LD structured data
+    soup = BeautifulSoup(html, "html.parser")
+    import json
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+            for field in ["dateModified", "datePublished", "uploadDate"]:
+                if field in data:
+                    val = data[field]
+                    dt = datetime.fromisoformat(val[:10])
+                    return dt.strftime("%B %d, %Y"), dt
+        except Exception:
+            pass
+    # Strategy 3: <time> or meta tags
+    for el in soup.find_all(["time", "meta"])[:20]:
+        dt_val = el.get("datetime") or el.get("content", "")
+        if dt_val and re.match(r"\d{4}-\d{2}-\d{2}", dt_val):
+            try:
+                dt = datetime.fromisoformat(dt_val[:10])
+                return dt.strftime("%B %d, %Y"), dt
+            except Exception:
+                pass
+    return "", None
+
+
+def get_download_date(session, download_url):
+    """Get date from download file headers (datasheet, stepfile, product sheet)."""
+    if not download_url:
+        return "", None
+    try:
+        resp = session.get(
+            download_url,
+            headers=HEADERS,
+            timeout=20,
+            stream=True,
+            allow_redirects=True
+        )
+        resp.close()
+        if resp.status_code in (200, 206):
+            date_str, date_obj = get_date_from_headers(resp.headers)
+            if date_obj:
+                return date_str, date_obj
+        # Check redirect final URL
+        if resp.history:
+            for r in reversed(resp.history):
+                date_str, date_obj = get_date_from_headers(r.headers)
+                if date_obj:
+                    return date_str, date_obj
+    except Exception:
+        pass
+    return "", None
 
 
 def parse_product_page(html, url):
@@ -58,13 +131,24 @@ def parse_product_page(html, url):
     parts = url.replace(BASE_URL + "/en/industrial-optics/lenses/", "").split("/")
     category = parts[0].replace("-", " ").title() if len(parts) > 0 else ""
     family = parts[1].replace("-", " ").title() if len(parts) > 1 else ""
-    datasheet_url = ""
+    
+    # Collect ALL download links (datasheet, stepfile, product sheet)
+    download_links = {}
     for a in soup.find_all("a", href=True):
         text = a.get_text(strip=True).lower()
         href = a["href"]
-        if text == "datasheet" and ("download_file" in href or href.endswith(".pdf")):
-            datasheet_url = href if href.startswith("http") else BASE_URL + href
-            break
+        if "download_file" not in href and not href.endswith(".pdf"):
+            continue
+        full_url = href if href.startswith("http") else BASE_URL + href
+        if "datasheet" in text or "데이터시트" in text:
+            download_links["datasheet"] = full_url
+        elif "step" in text or "스텝" in text:
+            download_links["stepfile"] = full_url
+        elif "product sheet" in text or "사양서" in text:
+            download_links["product_sheet"] = full_url
+        elif "download_file" in href:
+            download_links.setdefault("other", full_url)
+    
     body_text = soup.get_text(" ", strip=True)
     focal = re.search(r'Focal length[:\s]+([0-9.,\s\-mmMM]+)', body_text)
     aper = re.search(r'Aperture[:\s]+(F[\d.,\-]+)', body_text)
@@ -75,37 +159,22 @@ def parse_product_page(html, url):
         "Focal Length": focal.group(1).strip() if focal else "",
         "Aperture": aper.group(1).strip() if aper else "",
         "Product URL": url,
-        "Datasheet URL": datasheet_url,
+        "Download Links": download_links,
     }
-
-
-def get_datasheet_date(session, url):
-    if not url:
-        return "", None
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=15, stream=True)
-        resp.close()
-        lm = resp.headers.get("Last-Modified", "")
-        if lm:
-            dt = parsedate_to_datetime(lm)
-            return dt.strftime("%B %d, %Y"), dt.replace(tzinfo=None)
-    except Exception:
-        pass
-    return "", None
 
 
 def fetch_page(session, url, retries=3):
     for attempt in range(retries):
         try:
-            resp = session.get(url, headers=HEADERS, timeout=15)
+            resp = session.get(url, headers=HEADERS, timeout=20)
             if resp.status_code == 200:
-                return resp.text
+                return resp.text, dict(resp.headers)
             time.sleep(1)
         except requests.RequestException:
             if attempt == retries - 1:
-                return None
+                return None, {}
             time.sleep(2)
-    return None
+    return None, {}
 
 
 def scrape_all(delay, status_box, progress_bar, log_box):
@@ -117,22 +186,34 @@ def scrape_all(delay, status_box, progress_bar, log_box):
         total = len(product_urls)
         log_box.text(f"Found {total} product pages")
         for i, url in enumerate(product_urls):
-            status_box.info(f"[{i+1}/{total}] Collecting product page...")
+            status_box.info(f"[{i+1}/{total}] Collecting: {url.split('/')[-1][:40]}")
             try:
-                html = fetch_page(session, url)
+                html, page_headers = fetch_page(session, url)
                 if not html:
                     continue
                 record = parse_product_page(html, url)
-                if record["Datasheet URL"]:
-                    date_str, date_obj = get_datasheet_date(session, record["Datasheet URL"])
-                    record["Update Date"] = date_str
-                    record["_date_obj"] = date_obj
-                else:
-                    record["Update Date"] = ""
-                    record["_date_obj"] = None
+                
+                # Try to get date: 1) from page headers, 2) from download files
+                date_str, date_obj = get_date_from_page(html, page_headers)
+                
+                if not date_obj:
+                    # Try each download file in priority order
+                    dl_links = record.get("Download Links", {})
+                    for key in ["datasheet", "product_sheet", "stepfile", "other"]:
+                        dl_url = dl_links.get(key, "")
+                        if dl_url:
+                            date_str, date_obj = get_download_date(session, dl_url)
+                            if date_obj:
+                                break
+                
+                record["Update Date"] = date_str
+                record["_date_obj"] = date_obj
+                record["Datasheet URL"] = record["Download Links"].get("datasheet", "")
+                del record["Download Links"]
                 all_records.append(record)
+                
                 log_box.text(
-                    f"[{i+1}/{total}] {record['Product Name'][:40]} "
+                    f"[{i+1}/{total}] {record['Product Name'][:35]} "
                     f"| {record['Update Date'] or 'No date'}"
                 )
             except Exception as e:
@@ -198,7 +279,7 @@ with st.sidebar:
 
 st.title("Schneider-Kreuznach")
 st.subheader("Lens Datasheet Update & New Product Tracker")
-st.caption("sitemap -> product pages -> Datasheet Last-Modified header")
+st.caption("sitemap -> product pages -> multi-source date detection")
 
 if "df_result" not in st.session_state:
     st.session_state["df_result"] = None
@@ -223,7 +304,8 @@ if run_btn:
             df = pd.DataFrame(records)
             st.session_state["df_result"] = df
             st.session_state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            status_box.success(f"Collection complete! Total {len(df):,} items")
+            dated_count = df["_date_obj"].notna().sum()
+            status_box.success(f"Collection complete! {len(df):,} items | {dated_count:,} with date")
             progress_bar.progress(1.0)
     except Exception as e:
         status_box.error(f"Error: {e}")
@@ -259,9 +341,7 @@ if df is not None and not df.empty:
                 ["Product Name", "Category", "Lens Family", "Update Date", "Datasheet URL", "Product URL"]
             ].reset_index(drop=True)
             st.dataframe(
-                new_df,
-                use_container_width=True,
-                hide_index=True,
+                new_df, use_container_width=True, hide_index=True,
                 column_config={
                     "Product URL": st.column_config.LinkColumn("Product URL"),
                     "Datasheet URL": st.column_config.LinkColumn("Datasheet"),
@@ -293,12 +373,8 @@ if df is not None and not df.empty:
                 ].reset_index(drop=True)
             )
             st.dataframe(
-                top5,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Datasheet URL": st.column_config.LinkColumn("Datasheet"),
-                },
+                top5, use_container_width=True, hide_index=True,
+                column_config={"Datasheet URL": st.column_config.LinkColumn("Datasheet")},
             )
         with c2:
             st.markdown("#### Updates by Month")
@@ -314,9 +390,7 @@ if df is not None and not df.empty:
     display_cols = ["Product Name", "Category", "Lens Family", "Focal Length", "Aperture", "Update Date", "Datasheet URL", "Product URL"]
     show_df = filtered[display_cols].reset_index(drop=True)
     st.dataframe(
-        show_df,
-        use_container_width=True,
-        hide_index=True,
+        show_df, use_container_width=True, hide_index=True,
         column_config={
             "Product URL": st.column_config.LinkColumn("Product URL"),
             "Datasheet URL": st.column_config.LinkColumn("Datasheet"),
@@ -344,8 +418,11 @@ else:
     st.markdown("""
     ### How it works
     1. Reads product URLs from Schneider-Kreuznach sitemap
-    2. Visits each product page (name, category, family, datasheet link)
-    3. GET request to datasheet PDF to read Last-Modified header
+    2. Visits each product page to collect name, category, family, download links
+    3. Date detection (multi-source):
+       - HTTP Last-Modified / Date header from product page
+       - JSON-LD dateModified / datePublished fields
+       - Datasheet / Product sheet / Stepfile Last-Modified header
     4. Displays results with filters and download options
 
     **New Product Check**: Run twice then press [New Product Check] to compare.
